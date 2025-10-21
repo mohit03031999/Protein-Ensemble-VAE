@@ -44,8 +44,6 @@ protein_ensemble_dataset/
 
 wandb/
 
-checkpoints/
-
 # Logs
 logs/
 *.log
