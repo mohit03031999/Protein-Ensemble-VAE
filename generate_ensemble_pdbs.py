@@ -398,8 +398,9 @@ def generate_ensembles(model, dataset, device, num_samples=10, output_dir='gener
             print(f"\nProcessing structure {idx + 1}/{len(dataset)}...")
             
             # Get data
-            n, ca, c, mask, seq_emb, dih, seq_labels = dataset[idx]  # Updated: now includes seq_labels
-            
+            n, ca, c, mask, seq_emb, dih = dataset[idx][:6]  # Only take first 6 values
+
+
             # Get metadata from conformer
             conformer = dataset.conformers[idx]
             h5_path = conformer['h5']
@@ -707,7 +708,7 @@ def main():
     seqemb_dim = None
     if args.use_seqemb:
         for i in range(len(dataset)):
-            _, _, _, _, emb, _, _ = dataset[i]  # Updated: now returns 7 values (added seq_labels)
+            _, _, _, _, emb, _ = dataset[i][:6]  # Updated: now returns 7 values (added seq_labels)
             if emb is not None:
                 seqemb_dim = emb.shape[-1]
                 break

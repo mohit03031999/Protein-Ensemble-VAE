@@ -82,7 +82,7 @@ class EGNLayer(nn.Module):
             coord_delta = coord_delta * degree_inv[:, None]
 
         # Scale down coordinate updates to prevent instability
-        coord_delta = coord_delta * 1.0
+        coord_delta = coord_delta * 0.2
         x = x + coord_delta  # Apply update once (already scaled above)
         return h, x
 
@@ -116,6 +116,7 @@ class EGNNDecoder(nn.Module):
         total_in = z_g + z_l
         self.input_embedding = nn.Linear(total_in, hidden_dim)
         self.layers = nn.ModuleList([EGNLayer(hidden_dim, hidden_dim) for _ in range(num_layers)])
+        self.num_layers = num_layers
         
         # Latent-dependent coordinate initialization
         # This MLP converts latent codes to initial CA coordinates
@@ -138,7 +139,7 @@ class EGNNDecoder(nn.Module):
         # Output heads for N, CA, C atom offsets from CA position
         # We predict CA directly, then N and C as offsets
         
-        # NEW APPROACH: Context-aware bond length prediction
+        # Context-aware bond length prediction
         # Instead of hardcoding 1.46Å and 1.52Å, let model learn from context!
         # Inspired by ESMFold's multi-scale prediction
         
@@ -156,18 +157,18 @@ class EGNNDecoder(nn.Module):
             nn.Linear(hidden_dim // 2, 4)  # 3 for direction + 1 for length adjustment
         )
         
-        # NEW: Sequence prediction head (predicts amino acid type from node features)
+        # Sequence prediction head (predicts amino acid type from node features)
         # Takes refined node features h and predicts logits for 20 amino acids
         self.sequence_head = nn.Sequential(
-        nn.Linear(z_g + z_l, hidden_dim * 2),  # Larger capacity
+        nn.Linear(hidden_dim, hidden_dim * 2),  # Changed input dim!
         nn.LayerNorm(hidden_dim * 2),
         nn.ReLU(),
-        nn.Dropout(dropout * 0.5),  # Less dropout for sequence
+        nn.Dropout(dropout * 0.5),
         nn.Linear(hidden_dim * 2, hidden_dim),
         nn.LayerNorm(hidden_dim),
         nn.ReLU(),
         nn.Dropout(dropout * 0.5),
-        nn.Linear(hidden_dim, 20)  # 20 amino acids
+        nn.Linear(hidden_dim, 20)
     )
 
     @staticmethod
@@ -231,8 +232,6 @@ class EGNNDecoder(nn.Module):
             # Inputs per-residue (only valid positions)
             zg_rep = z_g[b].unsqueeze(0).expand(Lb, -1)                   # [Lb, z_g]
             z_combined = torch.cat([zg_rep, z_l[b, valid_idx]], dim=-1)  # [Lb, z_g + z_l]
-
-            seq_logits_valid = self.sequence_head(z_combined)
             
             # Initialize CA coordinates from latent
             x_ca = self.latent_to_coords(z_combined)  # [Lb, 3]
@@ -249,6 +248,9 @@ class EGNNDecoder(nn.Module):
             for layer in self.layers:
                 h, x_ca = layer(h, x_ca, edge_index, degree_inv=degree_inv)
                 h = self.dropout(h)  # Regularize node features
+            
+            # Predict sequence from REFINED features (after EGNN processing)
+            seq_logits_valid = self.sequence_head(h)
                 
             # Final centering for translation invariance
             # x_ca = x_ca - x_ca.mean(dim=0, keepdim=True)
@@ -274,52 +276,39 @@ class EGNNDecoder(nn.Module):
             
             # Apply learned adjustment with sigmoid to keep within tolerances
             # sigmoid(x) ∈ [0,1], scale to [-0.05, +0.05]
-            n_length_delta = (torch.sigmoid(n_length_adj) - 0.5) * 0.10  # ±0.05Å
-            c_length_delta = (torch.sigmoid(c_length_adj) - 0.5) * 0.10  # ±0.05Å
+            # n_length_delta = torch.tanh(n_length_adj) * 0.01 
+            # c_length_delta = torch.tanh(c_length_adj) *0.01 
             
-            n_length = n_base_length + n_length_delta  # [Lb, 1] - context-aware!
-            c_length = c_base_length + c_length_delta  # [Lb, 1] - context-aware!
+            # n_length = n_base_length + n_length_delta  # [Lb, 1] - context-aware!
+            # c_length = c_base_length + c_length_delta  # [Lb, 1] - context-aware!
             
             # Normalize direction and scale by context-aware length
             n_direction_norm = F.normalize(n_direction, dim=-1)  # [Lb, 3]
             c_direction_norm = F.normalize(c_direction, dim=-1)  # [Lb, 3]
             
-            n_offset_constrained = n_direction_norm * n_length  # [Lb, 3]
-            c_offset_constrained = c_direction_norm * c_length  # [Lb, 3]
+            n_offset_constrained = n_direction_norm * n_base_length  # [Lb, 3]
+            c_offset_constrained = c_direction_norm * c_base_length  # [Lb, 3]
             
             x_n = x_ca + n_offset_constrained
             x_c = x_ca + c_offset_constrained
             
             # Context-aware C-N PEPTIDE BONDS with soft constraints
-            # Most critical bond! Length varies with geometry:
-            #   Trans (ω≈180°): 1.329Å  (standard)
-            #   Cis (ω≈0°):     1.341Å  (12pm longer due to strain)
-            #   Strained loops: 1.320-1.350Å (depends on context)
-            #
-            if Lb > 1:
-                for i in range(Lb - 1):
-                    # Vector from C(i) to N(i+1)
-                    peptide_vec = x_n[i+1] - x_c[i]
-                    peptide_dist = torch.norm(peptide_vec)
-                    
-                    # Soft constraint: target 1.33Å, but allow 1.31-1.35Å
-                    peptide_target = 1.33
-                    peptide_tolerance = 0.02  # ±0.02Å is chemically reasonable
-                    
-                    peptide_vec_unit = peptide_vec / (peptide_dist + 1e-8)
-                    
-                    # Only enforce if outside acceptable range
-                    # This lets model learn context-dependent lengths!
-                    if peptide_dist < peptide_target - peptide_tolerance:
-                        # Too short → pull to minimum acceptable (1.31Å)
-                        peptide_vec_constrained = peptide_vec_unit * (peptide_target - peptide_tolerance)
-                        x_n[i+1] = x_c[i] + peptide_vec_constrained
-                    elif peptide_dist > peptide_target + peptide_tolerance:
-                        # Too long → pull to maximum acceptable (1.35Å)
-                        peptide_vec_constrained = peptide_vec_unit * (peptide_target + peptide_tolerance)
-                        x_n[i+1] = x_c[i] + peptide_vec_constrained
-                    # else: within [1.31, 1.35]Å → keep as-is! Model made a good prediction.
 
+            if Lb > 1:
+                # Use 3 iterations of 15% correction = ~40% total (smoother)
+                for iter_idx in range(3):
+                    peptide_vecs = x_n[1:] - x_c[:-1]
+                    peptide_dists = torch.norm(peptide_vecs, dim=-1, keepdim=True)
+                    
+                    # Gentle 15% pull per iteration
+                    deviation = (1.33 / (peptide_dists + 1e-8)) - 1.0
+                    scale = 1.0 + 0.15 * deviation  # Reduced from 0.4
+                    
+                    # Critical: clamp to prevent overcorrection
+                    scale = torch.clamp(scale, 0.90, 1.10)  # Max 10% change per iter
+                    
+                    x_n[1:] = x_c[:-1] + peptide_vecs * scale
+            
             # Scatter back into L-length tensors
             full_ca = torch.zeros(L, 3, device=device, dtype=h.dtype)
             full_n = torch.zeros(L, 3, device=device, dtype=h.dtype)

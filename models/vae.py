@@ -37,24 +37,25 @@ def main():
 
     # Loss weights
     ap.add_argument("--pair_stride", type=int, default=8)
-    ap.add_argument("--w_rec", type=float, default=50.0, help="Weight for reconstruction - MAXIMUM priority for sub-angstrom")
-    ap.add_argument("--w_pair", type=float, default=30.0, help="Weight for pair distance - increased for fine structure")
-    ap.add_argument("--kl_warmup_epochs", type=int, default=40)
+    ap.add_argument("--w_rec", type=float, default=10.0, help="Weight for reconstruction - MAXIMUM priority for sub-angstrom")
+    ap.add_argument("--w_pair", type=float, default=10.0, help="Weight for pair distance - increased for fine structure")
+    ap.add_argument("--kl_warmup_epochs", type=int, default=20)
     ap.add_argument("--klw_global", type=float, default=1.0, help="KL weight for global - reduced for better diversity")
     ap.add_argument("--klw_local", type=float, default=0.5, help="KL weight for local - reduced for better diversity")
-    ap.add_argument("--w_dihedral", type=float, default=1.0, help="Weight for dihedral - minimal for sub-angstrom")
-    ap.add_argument("--w_rama", type=float, default=10, help="Weight for Ramachandran - minimal for sub-angstrom")
-    ap.add_argument("--w_bond", type=float, default=80.0, help="Weight for bond length - CRITICAL for C-N peptide bonds")
-    ap.add_argument("--w_angle", type=float, default=80.0, help="Weight for bond angle - important for backbone geometry")
+    ap.add_argument("--w_dihedral", type=float, default=20.0, help="Weight for dihedral - minimal for sub-angstrom")
+    ap.add_argument("--w_rama", type=float, default=400, help="Weight for Ramachandran - minimal for sub-angstrom")
+    ap.add_argument("--w_bond", type=float, default=500.0, help="Weight for bond length - CRITICAL for C-N peptide bonds")
+    ap.add_argument("--w_angle", type=float, default=500.0, help="Weight for bond angle - important for backbone geometry")
     ap.add_argument("--w_seq", type=float, default=50.0, help="Weight for sequence prediction loss")
-    
+    ap.add_argument("--w_clash", type=float, default=300.0, help="Weight for clash loss")
+
     # KL Annealing (Expert-level posterior collapse prevention)
     ap.add_argument("--kl_schedule", type=str, default="cyclical", 
                     choices=["cyclical", "monotonic", "adaptive", "exponential"],
                     help="KL annealing schedule type (cyclical recommended for ensembles)")
     ap.add_argument("--kl_cycles", type=int, default=4, 
                     help="Number of cycles for cyclical annealing")
-    ap.add_argument("--kl_ratio", type=float, default=0.5,
+    ap.add_argument("--kl_ratio", type=float, default=0.4,
                     help="Ratio of cycle spent increasing (cyclical only, 0.5=linear sawtooth)")
 
     # Runtime
@@ -124,6 +125,7 @@ def main():
                 'w_bond': args.w_bond,
                 'w_angle': args.w_angle,
                 'w_seq': args.w_seq,
+                'w_clash': args.w_clash,
                 # Runtime
                 'device': args.device,
             },

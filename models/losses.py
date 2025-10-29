@@ -6,6 +6,7 @@ Contains all loss functions for the protein VAE model.
 
 import torch
 import torch.nn.functional as F
+import math
 
 
 def rmsd_loss(pred, target, mask):
@@ -83,35 +84,51 @@ def ramachandran_loss(dihedrals, mask, aa_types=None):
     """
     if dihedrals.numel() == 0:
         return torch.tensor(0.0, device=mask.device)
-        
-    # Extract phi and psi angles from sin/cos
-    sin_phi, cos_phi = dihedrals[..., 0], dihedrals[..., 1]  # [B,L]
-    sin_psi, cos_psi = dihedrals[..., 2], dihedrals[..., 3]  # [B,L]
     
-    # Convert to angles (radians)
-    phi = torch.atan2(sin_phi, cos_phi)  # [B,L]
-    psi = torch.atan2(sin_psi, cos_psi)  # [B,L]
+    phi = torch.atan2(dihedrals[..., 0], dihedrals[..., 1])
+    psi = torch.atan2(dihedrals[..., 2], dihedrals[..., 3])
     
-    # Define forbidden regions (simpler approach)
-    # Core forbidden regions based on steric clashes
-    forbidden_mask = (
-        # Left-handed alpha helix region (rare)
-        ((phi > 0.5) & (phi < 1.5) & (psi > -0.5) & (psi < 1.5)) |
-        # Extreme angles (physically impossible)
-        (torch.abs(phi) > 3.0) | (torch.abs(psi) > 3.0) |
-        # Very tight turns (sterically forbidden)
-        ((torch.abs(phi) < 0.3) & (torch.abs(psi) < 0.3))
+    # Alpha helix: φ ≈ -60° ± 20°, ψ ≈ -45° ± 20° (wider allowance)
+    alpha_helix = torch.exp(-(
+        (phi + 1.05)**2 / 0.6 +   # Width increased: 0.25 → 0.6
+        (psi + 0.79)**2 / 0.6
+    ))
+    
+    # Beta sheet: φ ≈ -120° ± 30°, ψ ≈ +120° ± 30°
+    beta_sheet = torch.exp(-(
+        (phi + 2.09)**2 / 0.9 +    # Width increased: 0.25 → 0.9
+        (psi - 2.09)**2 / 0.9
+    ))
+    
+    # Left-handed alpha (allowed for Gly): φ ≈ +60°, ψ ≈ +45°
+    left_alpha = torch.exp(-(
+        (phi - 1.05)**2 / 0.6 +
+        (psi - 0.79)**2 / 0.6
+    ))
+    
+    # Polyproline II (common in coils): φ ≈ -75°, ψ ≈ +145°
+    ppII = torch.exp(-(
+        (phi + 1.31)**2 / 0.5 +
+        (psi - 2.53)**2 / 0.5
+    ))
+    
+    # Combine all allowed regions
+    in_allowed = torch.maximum(
+        torch.maximum(alpha_helix, beta_sheet),
+        torch.maximum(left_alpha, ppII)
     )
     
-    # Apply penalty only to forbidden regions
-    penalty = torch.where(forbidden_mask, 
-                         torch.tensor(1.0, device=phi.device), 
-                         torch.tensor(0.0, device=phi.device))
+    # Penalty = 1 - (how much in allowed)
+    penalty = 1.0 - in_allowed
     
-    # Apply mask and return mean
-    masked_penalty = (penalty * mask).sum() / mask.sum()
+    # Add STRONG penalty for highly forbidden regions
+    # (e.g., positive phi in non-Gly residues)
+    forbidden_mask = (phi > 0) & (psi < 0)  # Forbidden quadrant
+    forbidden_penalty = 5.0 * forbidden_mask.float()  # Heavy penalty
     
-    return masked_penalty * 0.5  # Reduced scale for stability
+    total_penalty = penalty + forbidden_penalty
+    
+    return (total_penalty * mask).sum() / mask.sum()
 
 def ang_wrap(x):  # maps to (-π, π]
     return torch.atan2(torch.sin(x), torch.cos(x))
@@ -317,12 +334,12 @@ def bond_length_loss(pred_N, pred_CA, pred_C, mask):
     # N-CA bond lengths - use Huber loss for stability
     n_ca_dists = torch.norm(pred_CA - pred_N, dim=-1)  # [B, L]
     n_ca_error = n_ca_dists - 1.46
-    n_ca_penalty = (huber_loss(n_ca_error, delta=0.3) * mask).sum() / mask.sum()
+    n_ca_penalty = (huber_loss(n_ca_error, delta=0.02) * mask).sum() / mask.sum()
     
     # CA-C bond lengths
     ca_c_dists = torch.norm(pred_C - pred_CA, dim=-1)  # [B, L]
     ca_c_error = ca_c_dists - 1.52
-    ca_c_penalty = (huber_loss(ca_c_error, delta=0.3) * mask).sum() / mask.sum()
+    ca_c_penalty = (huber_loss(ca_c_error, delta=0.02) * mask).sum() / mask.sum()
     
     # C-N peptide bond (between residues) - most critical
     if pred_N.shape[1] > 1:
@@ -331,11 +348,11 @@ def bond_length_loss(pred_N, pred_CA, pred_C, mask):
         mask_peptide = mask[:, :-1] * mask[:, 1:]  # Both residues must be valid
         
         # Use Huber loss with tighter delta for peptide bonds
-        c_n_penalty = (huber_loss(c_n_error, delta=0.15) * mask_peptide).sum() / mask_peptide.sum()
+        c_n_penalty = (huber_loss(c_n_error, delta=0.01) * mask_peptide).sum() / mask_peptide.sum()
     else:
         c_n_penalty = torch.tensor(0.0, device=pred_N.device)
     
-    return n_ca_penalty + ca_c_penalty + c_n_penalty
+    return n_ca_penalty + ca_c_penalty + 2*c_n_penalty
 
 
 def _angle_cos(A, B, C, eps=1e-8):
@@ -352,59 +369,43 @@ def _angle_cos(A, B, C, eps=1e-8):
 
 
 def bond_angle_loss(pred_N, pred_CA, pred_C, mask):
-    """
-    Enforce three canonical backbone angles using squared error in cosine-space:
-      - ∠(N–Cα–C)   ≈ 110°
-      - ∠(C–N–Cα)   ≈ 121°
-      - ∠(Cα–C–N)   ≈ 116°
-    Inputs:
-      pred_* : [B, L, 3]
-      mask   : [B, L] (bool or 0/1)
-    Returns:
-      scalar loss
-    """
-    B, L, _ = pred_CA.shape
+    """Enforce backbone angles using Huber loss in angle space."""
     device = pred_CA.device
     mask = mask.float()
-
-    # Target cosines (precomputed for stability)
-    COS_110 = -0.3420201433256687  # cos(110°)
-    COS_121 = -0.5150380749100542  # cos(121°)
-    COS_116 = -0.4383711467890774  # cos(116°)
-
-    # 1) N–Cα–C at each residue i (all i)
-    cos_ncac = _angle_cos(pred_N, pred_CA, pred_C)                # [B, L]
-    den1 = mask.sum()
-    loss_ncac = (((cos_ncac - COS_110) ** 2) * mask).sum() / den1
-
-    # 2) C–N–Cα at residue i uses C(i-1), N(i), CA(i)  -> valid for i = 1..L-1
-    if L > 1:
-        cos_cnnca = _angle_cos(
-            pred_C[:, :-1],              # C(i-1)
-            pred_N[:, 1:],               # N(i)
-            pred_CA[:, 1:]               # CA(i)
-        )                                # [B, L-1]
-        mask_cnnca = (mask[:, :-1] * mask[:, 1:])                  # [B, L-1]
-        den2 = mask_cnnca.sum()
-        loss_cnnca = (((cos_cnnca - COS_121) ** 2) * mask_cnnca).sum() / den2
+    
+    # Target angles in RADIANS
+    TARGET_NCAC = 110.0 * torch.pi / 180.0  # 1.919 rad
+    TARGET_CNNCA = 121.0 * torch.pi / 180.0  # 2.111 rad
+    TARGET_CACN = 116.0 * torch.pi / 180.0  # 2.024 rad
+    
+    # 1) N–Cα–C angle
+    cos_ncac = _angle_cos(pred_N, pred_CA, pred_C)
+    angle_ncac = torch.acos(torch.clamp(cos_ncac, -1.0, 1.0))  # [B, L]
+    error_ncac = angle_ncac - TARGET_NCAC
+    loss_ncac = (huber_loss(error_ncac, delta=0.1) * mask).sum() / mask.sum()
+    
+    # 2) C–N–Cα angle (inter-residue)
+    if pred_N.shape[1] > 1:
+        cos_cnnca = _angle_cos(pred_C[:, :-1], pred_N[:, 1:], pred_CA[:, 1:])
+        angle_cnnca = torch.acos(torch.clamp(cos_cnnca, -1.0, 1.0))
+        error_cnnca = angle_cnnca - TARGET_CNNCA
+        mask_cnnca = mask[:, :-1] * mask[:, 1:]
+        loss_cnnca = (huber_loss(error_cnnca, delta=0.1) * mask_cnnca).sum() / mask_cnnca.sum()
     else:
-        loss_cnnca = pred_CA.new_tensor(0.0)
-
-    # 3) Cα–C–N at residue i uses CA(i), C(i), N(i+1) -> valid for i = 0..L-2
-    if L > 1:
-        cos_cacn = _angle_cos(
-            pred_CA[:, :-1],             # CA(i)
-            pred_C[:, :-1],              # C(i)
-            pred_N[:, 1:]                # N(i+1)
-        )                                # [B, L-1]
-        mask_cacn = (mask[:, :-1] * mask[:, 1:])                   # [B, L-1]
-        den3 = mask_cacn.sum()
-        loss_cacn = (((cos_cacn - COS_116) ** 2) * mask_cacn).sum() / den3
+        loss_cnnca = torch.tensor(0.0, device=device)
+    
+    # 3) Cα–C–N angle (inter-residue)
+    if pred_N.shape[1] > 1:
+        cos_cacn = _angle_cos(pred_CA[:, :-1], pred_C[:, :-1], pred_N[:, 1:])
+        angle_cacn = torch.acos(torch.clamp(cos_cacn, -1.0, 1.0))
+        error_cacn = angle_cacn - TARGET_CACN
+        mask_cacn = mask[:, :-1] * mask[:, 1:]
+        loss_cacn = (huber_loss(error_cacn, delta=0.1) * mask_cacn).sum() / mask_cacn.sum()
     else:
-        loss_cacn = pred_CA.new_tensor(0.0)
-
-    # Average the three penalties (keeps scale stable if sequences are short)
-    return (loss_ncac + loss_cnnca + loss_cacn) / 3.0
+        loss_cacn = torch.tensor(0.0, device=device)
+    
+    # Weight inter-residue angles 3x more (they're more important)
+    return loss_ncac + 2.0 * (loss_cnnca + loss_cacn)
 
 
 def sequence_classification_loss(pred_seq_logits, target_seq_labels, mask):
@@ -435,11 +436,91 @@ def sequence_classification_loss(pred_seq_logits, target_seq_labels, mask):
     
     return loss_masked.sum() / num_valid
 
+def clash_loss(pred_N, pred_CA, pred_C, mask, clash_dist=3.2, soft_margin=0.5):
+    """
+    FAST VECTORIZED clash loss - penalizes steric clashes without Python loops.
+    
+    Van der Waals radii:
+    - N: 1.55Å, C: 1.70Å, O: 1.52Å
+    - Min separation: ~3.0Å between heavy atoms
+    - We use 2.5Å as hard threshold for clashes
+    
+    Args:
+        pred_N, pred_CA, pred_C: [B, L, 3] backbone coordinates
+        mask: [B, L] validity mask
+        clash_dist: minimum allowed distance (Å) - default 2.5Å
+        soft_margin: soft margin for differentiability
+        
+    Returns:
+        Scalar clash penalty (mean over batch)
+    """
+    B, L = pred_CA.shape[:2]
+    device = pred_CA.device
+    
+    # Stack all atoms: [B, L, 3, 3] where dim=2 is [N, CA, C]
+    all_atoms = torch.stack([pred_N, pred_CA, pred_C], dim=2)  # [B, L, 3, 3]
+    all_atoms = all_atoms.reshape(B, L * 3, 3)  # [B, 3*L, 3]
+    
+    # Create atom mask: [B, 3*L]
+    atom_mask = torch.stack([mask, mask, mask], dim=2).reshape(B, L * 3)
+    
+    # Compute pairwise distances for all atoms in batch
+    # [B, 3*L, 3*L]
+    dists = torch.cdist(all_atoms, all_atoms)  # Euclidean distance
+    
+    # Create sequence separation mask
+    # We need to ignore atoms that are close in sequence (bonded neighbors)
+    # Atoms within same residue or adjacent residues are allowed to be close
+    atom_indices = torch.arange(L * 3, device=device)  # [3*L]
+    residue_indices = atom_indices // 3  # Which residue each atom belongs to
+    
+    # Compute residue separation: [3*L, 3*L]
+    res_sep = torch.abs(residue_indices[:, None] - residue_indices[None, :])
+    
+    # Atoms must be at least 2 residues apart (|i-j| >= 2) to be checked for clashes
+    # This allows bonded and next-neighbor atoms to be close
+    separation_mask = (res_sep >= 2).float()  # [3*L, 3*L]
+    
+    # Upper triangle mask to avoid double counting
+    triu_mask = torch.triu(torch.ones(L * 3, L * 3, device=device), diagonal=1)
+    
+    # Combine masks: [B, 3*L, 3*L]
+    # Valid pairs: both atoms valid, sufficient separation, upper triangle
+    pair_mask = (atom_mask[:, :, None] * atom_mask[:, None, :])  # [B, 3*L, 3*L]
+    pair_mask = pair_mask * separation_mask[None, :, :]  # Apply sequence separation
+    pair_mask = pair_mask * triu_mask[None, :, :]  # Apply upper triangle
+    
+    # Compute clash violations: [B, 3*L, 3*L]
+    violations = clash_dist - dists  # Positive = clash
+    violations = torch.relu(violations)  # Only keep distances < clash_dist
+    
+    # Apply soft margin for smooth gradients (Huber-like loss)
+    # For small violations: quadratic
+    # For large violations: linear
+    clash_penalty = torch.where(
+        violations < soft_margin,
+        0.5 * violations ** 2,
+        violations**2 # Quadratic for all! (was linear)
+    )
+    
+    # Apply pair mask and compute mean
+    masked_penalty = clash_penalty * pair_mask
+    
+    # Sum over pairs and normalize
+    total_clash = masked_penalty.sum(dim=[1, 2])  # [B]
+    num_pairs = pair_mask.sum(dim=[1, 2])  # [B]
+    
+    # Average over batch (only count samples with valid pairs)
+    loss = total_clash / (num_pairs + 1e-8)
+    loss = loss.mean()
+    
+    return loss
+
 
 def compute_total_loss(pred_N, pred_CA, pred_C, pred_seq, target_N, target_CA, target_C, target_seq_labels,
                       mask, mu_g, lv_g, mu_l, lv_l,
                       target_dihedrals, klw_g, klw_l, w_pair, pair_stride,
-                      w_dihedral, w_rama, w_bond, w_angle, w_rec, w_seq=1.0):
+                      w_dihedral, w_rama, w_bond, w_angle, w_rec, w_seq, w_clash):
     """
     Compute total loss with improved gradient flow and stability.
     
@@ -494,8 +575,11 @@ def compute_total_loss(pred_N, pred_CA, pred_C, pred_seq, target_N, target_CA, t
     loss_bond = bond_length_loss(pred_N, pred_CA, pred_C, mask)
     loss_angle = bond_angle_loss(pred_N, pred_CA, pred_C, mask)
     
-    # NEW: Sequence prediction loss
+    # Sequence prediction loss
     loss_seq = sequence_classification_loss(pred_seq, target_seq_labels, mask)
+
+    # Clash loss
+    loss_clash = clash_loss(pred_N, pred_CA, pred_C, mask)
 
     # Weighted total (w_rec gives explicit weight to reconstruction)
     loss = w_rec * loss_rec \
@@ -506,7 +590,8 @@ def compute_total_loss(pred_N, pred_CA, pred_C, pred_seq, target_N, target_CA, t
          + w_rama     * loss_rama_pred \
          + w_bond     * loss_bond \
          + w_angle    * loss_angle \
-         + w_seq      * loss_seq
+         + w_seq      * loss_seq \
+         + w_clash    * loss_clash
 
     return {
         'total': loss,
@@ -523,5 +608,6 @@ def compute_total_loss(pred_N, pred_CA, pred_C, pred_seq, target_N, target_CA, t
         'dihedral_total': loss_dihedral,
         'bond_length': loss_bond,
         'bond_angle': loss_angle,
-        'sequence': loss_seq
+        'sequence': loss_seq,
+        'clash': loss_clash
     }

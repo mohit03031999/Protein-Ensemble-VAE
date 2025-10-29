@@ -32,22 +32,17 @@ class DihedralAwareEncoder(nn.Module):
     Enhanced encoder that combines sequence embeddings, dihedral angles, and coordinates
     into a unified geometric representation for protein structures.
     """
-    def __init__(self, seq_dim: Optional[int], dihedral_dim: int = 6, d_model: int = 512, 
-                 nhead: int = 16, ff: int = 2048, nlayers: int = 6, dropout: float = 0.1,
+    def __init__(self, seq_dim: int, dihedral_dim: int, d_model: int, 
+                 nhead: int, ff: int, nlayers: int, dropout: float = 0.1,
                  d_pair: int = 128):
         super().__init__()
         self.seq_dim = seq_dim
         self.dihedral_dim = dihedral_dim
         self.d_model = d_model
         
-        # Multi-modal input projections
-        if seq_dim is not None:
-            self.seq_proj = nn.Linear(seq_dim, d_model // 2)
-            self.use_sequence = True
-        else:
-            self.seq_proj = None
-            self.use_sequence = False
-            
+        # Always use sequence embeddings - remove conditional logic
+        self.seq_proj = nn.Linear(seq_dim, d_model // 2)
+        
         self.dihedral_proj = nn.Linear(dihedral_dim, d_model // 4)
         # full backbone (N, CA, C) = 9D
         self.coord_proj = nn.Linear(9, d_model // 4)
@@ -55,8 +50,8 @@ class DihedralAwareEncoder(nn.Module):
         self.coord_norm = nn.LayerNorm(d_model // 4)
         self.dihedral_norm = nn.LayerNorm(d_model // 4)
         
-        # If no sequence embeddings, adjust dimensions
-        final_dim = d_model // 2 if not self.use_sequence else d_model
+        # Since we always use sequence embeddings, final dimension is fixed
+        final_dim = d_model  # seq(d_model/2) + coord(d_model/4) + dihedral(d_model/4)
         
         # Geometric feature fusion
         self.feature_fusion = nn.Sequential(
@@ -86,12 +81,12 @@ class DihedralAwareEncoder(nn.Module):
             embed_dim=d_model, num_heads=nhead//2, dropout=dropout, batch_first=True
         )
         
-    def forward(self, sequence_emb: Optional[torch.Tensor], 
+    def forward(self, sequence_emb: torch.Tensor, 
                 n_coords: torch.Tensor, ca_coords: torch.Tensor, c_coords: torch.Tensor,
                 dihedrals: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            sequence_emb: [B, L, seq_dim] or None
+            sequence_emb: [B, L, seq_dim] sequence embeddings (always provided)
             n_coords: [B, L, 3] N atom coordinates
             ca_coords: [B, L, 3] Cα atom coordinates  
             c_coords: [B, L, 3] C atom coordinates
@@ -147,32 +142,69 @@ class DihedralAwareEncoder(nn.Module):
 
 
 class HierLatent(nn.Module):
-    """Hierarchical latent space with global and local components."""
+    """Hierarchical latent space with global and local components using attention-based pooling."""
     def __init__(self, d_model: int, z_g: int = 64, z_l: int = 32):
         super().__init__()
-        # heads consume per-residue encoding only (no state conditioning)
-        self.global_head = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, 2*z_g))
-        self.local_head  = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, 2*z_l))
+        self.d_model = d_model
+        self.z_g = z_g
+        self.z_l = z_l
+        
+        # Attention-based global pooling instead of simple mean
+        self.global_attention = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=4, dropout=0.1, batch_first=True
+        )
+        self.global_query = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # Global head with attention-weighted features
+        self.global_head = nn.Sequential(
+            nn.Linear(d_model, 256), 
+            nn.ReLU(), 
+            nn.Linear(256, 2*z_g)
+        )
+        
+        # Local head (per residue)
+        self.local_head = nn.Sequential(
+            nn.Linear(d_model, 256), 
+            nn.ReLU(), 
+            nn.Linear(256, 2*z_l)
+        )
         
         with torch.no_grad():
-            # global_head last Linear outputs 2*z_g: [mu_g | lv_g]
+            # Initialize biases for stable training
             self.global_head[-1].bias[z_g:] = -2.0
-            self.local_head[-1].bias[z_l:]  = -2.0
+            self.local_head[-1].bias[z_l:] = -2.0
+            # Initialize global query with small values
+            self.global_query.data.normal_(0, 0.02)
 
     def forward(self, H, mask):
         """
         H: [B,L,d_model]; mask: [B,L]
+        Returns: mu_g, lv_g, mu_l, lv_l
         """
-        B,L,_ = H.shape
-        # global: masked mean
-        w = mask.unsqueeze(-1)              # [B,L,1]
-        gmean = (H * w).sum(1) / w.sum(1)   # [B,d_model]
-        g = self.global_head(gmean)                          # [B,2*z_g]
+        B, L, _ = H.shape
+        
+        # ========== GLOBAL LATENT (Attention-based pooling) ==========
+        # Create global query and compute attention weights
+        global_query = self.global_query.expand(B, -1, -1)  # [B, 1, d_model]
+        
+        # Apply attention with mask
+        attn_mask = ~mask.bool() if mask is not None else None
+        global_features, attn_weights = self.global_attention(
+            global_query, H, H, 
+            key_padding_mask=attn_mask
+        )
+        
+        # Global features from attention-weighted aggregation
+        global_features = global_features.squeeze(1)  # [B, d_model]
+        
+        # Pass through global head
+        g = self.global_head(global_features)  # [B, 2*z_g]
         mu_g, lv_g = torch.chunk(g, 2, dim=-1)
-
-        # local: per residue
-        l = self.local_head(H)                               # [B,L,2*z_l]
+        
+        # ========== LOCAL LATENT (Per residue) ==========
+        l = self.local_head(H)  # [B, L, 2*z_l]
         mu_l, lv_l = torch.chunk(l, 2, dim=-1)
+        
         return mu_g, lv_g, mu_l, lv_l
 
 
@@ -180,7 +212,7 @@ class ProteinEncoder(nn.Module):
     """
     Main encoder class that combines all encoding components.
     """
-    def __init__(self, seqemb_dim: Optional[int],
+    def __init__(self, seqemb_dim: int,
                  d_model: int = 512, nhead: int = 8, ff: int = 1024, nlayers: int = 6,
                  z_g: int = 512, z_l: int = 256, dropout: float = 0.1,
                  use_dihedrals: bool = True):

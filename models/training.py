@@ -20,7 +20,7 @@ from kl_schedulers import (
 
 
 def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
-              train, w_dihedral, w_rama, w_bond, w_angle, w_rec, w_seq, epoch):
+              train, w_dihedral, w_rama, w_bond, w_angle, w_rec, w_seq, w_clash, epoch):
     """
     Run one training or validation epoch.
     
@@ -48,38 +48,57 @@ def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
     else:     
         model.eval()
     
-    tot = tot_rec = tot_pair = tot_kg = tot_kl = tot_dih = tot_rama = tot_bond = tot_angle = tot_seq = 0.0
+    tot = tot_rec = tot_pair = tot_kg = tot_kl = tot_dih = tot_rama = tot_bond = tot_angle = tot_seq = tot_clash = 0.0
     tot_seq_acc = 0.0  # NEW: track sequence accuracy
     n = 0
     batch_idx = 0
     
-    for n_coords, ca_coords, c_coords, mask, seqemb, dihedrals, seq_labels in loader:
-        # Move all coordinates to device
-        n_coords = n_coords.to(device)     # [B,L,3]
-        ca_coords = ca_coords.to(device)   # [B,L,3]
-        c_coords = c_coords.to(device)     # [B,L,3]
-        mask   = mask.to(device)           # [B,L]
-        dihedrals = dihedrals.to(device)   # [B,L,6]
-        seq_labels = seq_labels.to(device) # [B,L] - NEW: sequence labels
-        if seqemb is not None: 
-            seqemb = seqemb.to(device)
+    for batch_data in loader:
+        # Pair-wise training: batch_data is (input_data, target_data)
+        input_data, target_data = batch_data
         
+        # Unpack input conformer (for encoding)
+        n_in, ca_in, c_in, mask_in, seqemb_in, dih_in, seq_lbl_in = input_data
+        # Unpack target conformer (for reconstruction)
+        n_tgt, ca_tgt, c_tgt, mask_tgt, seqemb_tgt, dih_tgt, seq_lbl_tgt = target_data
+        
+        # Move input data to device
+        n_in = n_in.to(device)
+        ca_in = ca_in.to(device)
+        c_in = c_in.to(device)
+        mask_in = mask_in.to(device)
+        dih_in = dih_in.to(device)
+        if seqemb_in is not None:
+            seqemb_in = seqemb_in.to(device)
+        
+        # Move target data to device
+        n_tgt = n_tgt.to(device)
+        ca_tgt = ca_tgt.to(device)
+        c_tgt = c_tgt.to(device)
+        mask_tgt = mask_tgt.to(device)
+        dih_tgt = dih_tgt.to(device)
+        seq_lbl_tgt = seq_lbl_tgt.to(device)
+        if seqemb_tgt is not None:
+            seqemb_tgt = seqemb_tgt.to(device)
+        
+        # Use mask from target for reconstruction (both should be same anyway)
+        mask = mask_tgt
 
         with torch.set_grad_enabled(train):
-            # Forward pass - now predicts coordinates AND sequence
+            # PAIR-WISE TRAINING: Encode input conformer, decode to reconstruct target
             pred_N, pred_CA, pred_C, pred_seq, mu_g, lv_g, mu_l, lv_l = model(
-                seqemb, n_coords, ca_coords, c_coords, dihedrals, mask
+                seqemb_in, n_in, ca_in, c_in, dih_in, mask
             )
 
-            # Compute all losses including sequence prediction
+            # Compute loss against TARGET conformer (not input!)
             loss_dict = compute_total_loss(
                 pred_N=pred_N, pred_CA=pred_CA, pred_C=pred_C, pred_seq=pred_seq,
-                target_N=n_coords, target_CA=ca_coords, target_C=c_coords, target_seq_labels=seq_labels,
+                target_N=n_tgt, target_CA=ca_tgt, target_C=c_tgt, target_seq_labels=seq_lbl_tgt,
                 mask=mask, mu_g=mu_g, lv_g=lv_g, mu_l=mu_l, lv_l=lv_l,
-                target_dihedrals=dihedrals,
+                target_dihedrals=dih_tgt,
                 klw_g=klw_g, klw_l=klw_l, w_pair=w_pair, pair_stride=pair_stride,
                 w_dihedral=w_dihedral, w_rama=w_rama, w_bond=w_bond, w_angle=w_angle,
-                w_rec=w_rec, w_seq=w_seq  # Use configurable sequence loss weight
+                w_rec=w_rec, w_seq=w_seq, w_clash=w_clash,
             )
             
             loss = loss_dict['total']
@@ -87,7 +106,7 @@ def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
             # NEW: Compute sequence accuracy
             with torch.no_grad():
                 pred_seq_labels = torch.argmax(pred_seq, dim=-1)  # [B, L]
-                correct = (pred_seq_labels == seq_labels) & mask.bool()
+                correct = (pred_seq_labels == seq_lbl_tgt) & mask.bool()
                 seq_accuracy = correct.sum().float() / mask.sum().float()
 
             # Print detailed loss info
@@ -112,6 +131,20 @@ def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
             if train:
                 opt.zero_grad()
                 loss.backward()
+                
+                # In training.py, after line 114 (loss.backward())
+                if not torch.isfinite(loss):
+                    print(f"❌ NaN/Inf loss detected at epoch {epoch}, batch {batch_idx}")
+                    print(f"   Loss components: {loss_dict}")
+                    print(f"   Coordinates - CA mean: {pred_CA.mean():.2f}, std: {pred_CA.std():.2f}")
+                    print(f"   Latents - mu_g: {mu_g.mean():.2f}, lv_g: {lv_g.mean():.2f}")
+                    raise ValueError("Training collapsed - NaN detected")
+
+                # Check individual loss components
+                for key, val in loss_dict.items():
+                    if not torch.isfinite(val):
+                        print(f"❌ NaN in loss component: {key} = {val}")
+                
                 # Gradient clipping to prevent explosion (more aggressive)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 opt.step()
@@ -124,7 +157,7 @@ def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
                     })
 
         # Accumulate statistics
-        bs = ca_coords.size(0)
+        bs = ca_tgt.size(0)
         tot      += loss.item() * bs
         tot_rec  += loss_dict['reconstruction'].item() * bs
         tot_pair += loss_dict['pair_distance'].item() * bs
@@ -136,6 +169,7 @@ def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
         tot_angle += loss_dict['bond_angle'].item() * bs
         tot_seq  += loss_dict['sequence'].item() * bs  # NEW
         tot_seq_acc += seq_accuracy.item() * bs  # NEW
+        tot_clash += loss_dict['clash'].item() * bs  # NEW
         n += bs
         batch_idx += 1
     
@@ -150,7 +184,8 @@ def run_epoch(model, loader, opt, device, klw_g, klw_l, w_pair, pair_stride,
         bond=tot_bond/n,
         angle=tot_angle/n,
         seq=tot_seq/n,  # NEW
-        seq_acc=tot_seq_acc/n  # NEW
+        seq_acc=tot_seq_acc/n,  # NEW
+        clash=tot_clash/n  # NEW
     )
 
 
@@ -238,7 +273,7 @@ def train_model(model, train_loader, val_loader, args):
             model, train_loader, opt, device, klw_g, klw_l, 
             args.w_pair, args.pair_stride, train=True, 
             w_dihedral=args.w_dihedral, w_rama=args.w_rama,
-            w_bond=args.w_bond, w_angle=args.w_angle, w_rec=args.w_rec, w_seq=args.w_seq, epoch=epoch
+            w_bond=args.w_bond, w_angle=args.w_angle, w_rec=args.w_rec, w_seq=args.w_seq, w_clash=args.w_clash, epoch=epoch
         )
         
         # Validation epoch (use same KL weights as training)
@@ -248,7 +283,7 @@ def train_model(model, train_loader, val_loader, args):
             klw_l=klw_l,
             w_pair=args.w_pair, pair_stride=args.pair_stride, train=False,
             w_dihedral=args.w_dihedral, w_rama=args.w_rama,
-            w_bond=args.w_bond, w_angle=args.w_angle, w_rec=args.w_rec, w_seq=args.w_seq, epoch=epoch
+            w_bond=args.w_bond, w_angle=args.w_angle, w_rec=args.w_rec, w_seq=args.w_seq, w_clash=args.w_clash, epoch=epoch
         )
 
         # Store loss history
